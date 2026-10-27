@@ -1,62 +1,85 @@
-import glob
+import os
+from collections import Counter
 
 import matplotlib.pyplot as plt
 import pandas as pd
+import spotipy
+from dotenv import load_dotenv
+from spotipy.oauth2 import SpotifyOAuth
 
-# --- Load data -------------------------------------------------------------
-# Reads both the old endsong files and the new Streaming_History_Audio files.
-files = glob.glob("data/endsong_*.json") + glob.glob("data/Streaming_History_Audio_*.json")
-if not files:
-    raise SystemExit("No data files found in data/")
+load_dotenv()
 
-df = pd.concat([pd.read_json(f) for f in files], ignore_index=True)
+sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
+    scope="user-top-read user-read-recently-played playlist-read-private"))
 
-# Old and new exports overlap in time, so remove duplicate plays.
-df = df.drop_duplicates(subset=["ts", "spotify_track_uri"])
+TIME_RANGES = {
+    "short_term": "last 4 weeks",
+    "medium_term": "last 6 months",
+    "long_term": "all time (approx.)",
+}
 
-# Timestamps are in UTC. Convert to Norwegian time so "hour of day" is correct.
-df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_convert("Europe/Oslo")
+# --- 1. Top artists and tracks for each time range -------------------------
+for key, label in TIME_RANGES.items():
+    artists = sp.current_user_top_artists(limit=10, time_range=key)["items"]
+    tracks = sp.current_user_top_tracks(limit=10, time_range=key)["items"]
 
-# Keep music only, and only plays of at least 30 seconds.
-df = df[df["master_metadata_track_name"].notna()]
-df = df[df["ms_played"] >= 30_000]
+    print(f"\n=== {label} ===")
+    print("Top artists:")
+    for i, a in enumerate(artists, 1):
+        print(f"  {i:2}. {a['name']}")
+    print("Top tracks:")
+    for i, t in enumerate(tracks, 1):
+        print(f"  {i:2}. {t['name']} - {t['artists'][0]['name']}")
 
-df["hours"] = df["ms_played"] / 3_600_000
-df["artist"] = df["master_metadata_album_artist_name"]
+# --- 2. Genre profile from your top 50 artists (long term) -----------------
+top50 = sp.current_user_top_artists(limit=50, time_range="long_term")["items"]
+genres = Counter(g for a in top50 for g in a.get("genres", []))
 
-print(f"{len(df)} plays from {df['ts'].min().date()} to {df['ts'].max().date()}")
+if genres:
+    top_genres = pd.Series(dict(genres.most_common(15))).sort_values()
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.barh(top_genres.index, top_genres.values)
+    ax.set_title("Most common genres among your top 50 artists")
+    ax.set_xlabel("Number of artists")
+    fig.tight_layout()
+    fig.savefig("genres.png", dpi=150)
+else:
+    print("\nNo genre data returned by the API.")
 
-# --- Chart 1: listening hours per month (line chart) -----------------------
-monthly = df.set_index("ts")["hours"].resample("MS").sum()
+# --- 3. Recently played: save to a growing history file --------------------
+# The API only returns the last 50 plays. Running this script regularly and
+# appending to a CSV builds up your own listening history over time.
+os.makedirs("data", exist_ok=True)
+history_file = "data/recent_plays.csv"
 
-fig, ax = plt.subplots(figsize=(10, 4))
-ax.plot(monthly.index, monthly.values)
-ax.set_title("Listening hours per month")
-ax.set_ylabel("Hours")
-ax.grid(alpha=0.3)
-fig.tight_layout()
-fig.savefig("monthly_hours.png", dpi=150)
+items = sp.current_user_recently_played(limit=50)["items"]
+recent = pd.DataFrame([{
+    "played_at": it["played_at"],
+    "track": it["track"]["name"],
+    "artist": it["track"]["artists"][0]["name"],
+    "album": it["track"]["album"]["name"],
+    "duration_ms": it["track"]["duration_ms"],
+    "track_uri": it["track"]["uri"],
+} for it in items])
 
-# --- Chart 2: top 10 artists by hours (horizontal bar chart) ---------------
-top_artists = df.groupby("artist")["hours"].sum().nlargest(10).sort_values()
+if os.path.exists(history_file):
+    recent = pd.concat([pd.read_csv(history_file), recent], ignore_index=True)
 
-fig, ax = plt.subplots(figsize=(8, 5))
-ax.barh(top_artists.index, top_artists.values)
-ax.set_title("Top 10 artists")
-ax.set_xlabel("Hours")
-fig.tight_layout()
-fig.savefig("top_artists.png", dpi=150)
+recent = recent.drop_duplicates(subset=["played_at", "track_uri"]).sort_values("played_at")
+recent.to_csv(history_file, index=False)
+print(f"\n{len(recent)} plays saved in {history_file}")
 
-# --- Chart 3: listening by hour of day (bar chart) -------------------------
-by_hour = df.groupby(df["ts"].dt.hour)["hours"].sum().reindex(range(24), fill_value=0)
+# --- 4. Chart: recent plays by hour of day ---------------------------------
+recent["played_at"] = pd.to_datetime(recent["played_at"], utc=True, format="ISO8601").dt.tz_convert("Europe/Oslo")
+by_hour = recent.groupby(recent["played_at"].dt.hour).size().reindex(range(24), fill_value=0)
 
 fig, ax = plt.subplots(figsize=(10, 4))
 ax.bar(by_hour.index, by_hour.values)
-ax.set_title("Listening by hour of day")
+ax.set_title("Recent plays by hour of day")
 ax.set_xlabel("Hour")
-ax.set_ylabel("Hours")
+ax.set_ylabel("Plays")
 ax.set_xticks(range(24))
 fig.tight_layout()
-fig.savefig("by_hour.png", dpi=150)
+fig.savefig("recent_by_hour.png", dpi=150)
 
 plt.show()
